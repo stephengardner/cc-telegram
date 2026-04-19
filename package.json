@@ -1,0 +1,46 @@
+{
+  "name": "cc-telegram",
+  "version": "0.1.0",
+  "description": "Bidirectional bridge between a live Claude Code TUI session and Telegram. Inject chat messages into the agent's stdin and mirror its responses back to your phone.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./bin/cc-telegram.mjs",
+  "bin": {
+    "cc-telegram": "./bin/cc-telegram.mjs"
+  },
+  "files": [
+    "bin",
+    "scripts",
+    "README.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "scripts": {
+    "start": "node bin/cc-telegram.mjs",
+    "probe": "node scripts/probe.mjs"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "telegram",
+    "cli",
+    "terminal",
+    "agent",
+    "remote"
+  ],
+  "license": "MIT",
+  "author": "Stephen Gardner",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stephengardner/cc-telegram.git"
+  },
+  "bugs": {
+    "url": "https://github.com/stephengardner/cc-telegram/issues"
+  },
+  "homepage": "https://github.com/stephengardner/cc-telegram#readme"
+}

@@ -48,6 +48,11 @@ import { existsSync, readdirSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
+import {
+  CliRenderer,
+  createTelegramChannel,
+  startJsonlMirror as startJsonlMirrorCli,
+} from './lib/cli-renderer/index.js';
 
 // Script path layout: <project>/bin/cc-telegram.mjs. PROJECT_ROOT is
 // only used for packaging metadata; runtime paths (.env, Claude's cwd,
@@ -86,6 +91,7 @@ function parseArgs(argv) {
   const args = {
     resumeSessionId: null,
     mirror: true,
+    mirrorMode: 'cli', // 'cli' | 'simple'
     claudeArgs: [],
     verbose: false,
   };
@@ -95,6 +101,13 @@ function parseArgs(argv) {
       args.resumeSessionId = argv[++i];
     } else if (a === '--no-mirror') {
       args.mirror = false;
+    } else if (a === '--mode' && i + 1 < argv.length) {
+      const v = argv[++i];
+      if (v !== 'cli' && v !== 'simple') {
+        console.error(`Invalid --mode: ${v}. Expected 'cli' or 'simple'.`);
+        process.exit(1);
+      }
+      args.mirrorMode = v;
     } else if (a === '--claude-args' && i + 1 < argv.length) {
       args.claudeArgs = argv[++i].split(/\s+/).filter(Boolean);
     } else if (a === '--verbose') {
@@ -107,11 +120,20 @@ Incoming Telegram messages inject into the Claude Code stdin;
 Claude responses mirror back to Telegram as HTML-formatted chunks.
 
 Options:
-  --resume-session <id>   Resume a specific Claude Code session id
-  --no-mirror             Do not mirror Claude responses to Telegram (default: on)
-  --claude-args "..."     Extra args for claude (space-separated)
-  --verbose               Log Telegram poll activity + injection events
-  -h, --help              This help`);
+  --resume-session <id>   Resume a specific Claude Code session id.
+  --no-mirror             Do not mirror Claude responses to Telegram.
+                          (Default: mirror on.)
+  --mode cli|simple       Mirror UX mode (default: cli).
+                           cli    = one evolving throbber message per turn
+                                    with spinner, thinking-in-spoiler, tool
+                                    lines, live text preview, Stop button.
+                                    Collapses to the final assistant text
+                                    once the turn ends.
+                           simple = one plain message per assistant text
+                                    block. No throbber, no tool visibility.
+  --claude-args "..."     Extra args for claude (space-separated).
+  --verbose               Log Telegram poll activity + injection events.
+  -h, --help              This help.`);
       process.exit(0);
     }
   }
@@ -434,19 +456,39 @@ async function main() {
   const mirrorMinChars = 40;
   let mirrorController = null;
   if (args.mirror) {
-    mirrorController = startJsonlMirror({
-      repoRoot: CWD,
-      resumeSessionId: args.resumeSessionId,
-      onText: async (text) => {
-        if (text.length < mirrorMinChars) return;
-        await sendMirrorText(injector, text, { verbose: args.verbose });
-      },
-      onResolve: (p) => {
-        sessionFileRef.path = p;
-        if (args.verbose) console.error(`[tg] session file: ${p}`);
-      },
-      verbose: args.verbose,
-    });
+    if (args.mirrorMode === 'cli') {
+      // CLI-mode mirror: throbber + thinking-in-spoiler + tool lines +
+      // live preview + Stop placeholder, via the ported cli-renderer
+      // primitive. Requires a known session jsonl path; if we do not
+      // have --resume-session we wait briefly for a fresh session
+      // file to appear, then attach.
+      mirrorController = await startCliMirror({
+        resumeSessionId: args.resumeSessionId,
+        projectDir,
+        botToken,
+        chatId,
+        onResolve: (p) => {
+          sessionFileRef.path = p;
+          if (args.verbose) console.error(`[tg] session file: ${p}`);
+        },
+        verbose: args.verbose,
+      });
+    } else {
+      // Simple mode: one plain message per assistant text block.
+      mirrorController = startJsonlMirror({
+        repoRoot: CWD,
+        resumeSessionId: args.resumeSessionId,
+        onText: async (text) => {
+          if (text.length < mirrorMinChars) return;
+          await sendMirrorText(injector, text, { verbose: args.verbose });
+        },
+        onResolve: (p) => {
+          sessionFileRef.path = p;
+          if (args.verbose) console.error(`[tg] session file: ${p}`);
+        },
+        verbose: args.verbose,
+      });
+    }
   }
 
   // If mirror is disabled but we still want verification (the common
@@ -690,6 +732,78 @@ function chunkForTelegram(text, max = 4000) {
  *     in the project dir that wasn't there at wrapper start. Up to a
  *     30s wait; gives up quietly if none appears.
  */
+/**
+ * Resolve the session jsonl path: deterministic when resumeSessionId
+ * is given, otherwise wait up to timeoutMs for a fresh .jsonl to
+ * appear in the project dir. Returns null on timeout so the caller
+ * can fall back to a simpler mirror.
+ */
+async function resolveSessionFilePath({ projectDir, resumeSessionId, timeoutMs = 30_000, verbose = false }) {
+  if (resumeSessionId) return join(projectDir, `${resumeSessionId}.jsonl`);
+
+  const before = new Set();
+  try {
+    const entries = readdirSync(projectDir).filter((n) => n.endsWith('.jsonl'));
+    for (const e of entries) before.add(e);
+  } catch { /* project dir may not exist yet */ }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
+    try {
+      const entries = await readdir(projectDir);
+      for (const f of entries) {
+        if (!f.endsWith('.jsonl')) continue;
+        if (before.has(f)) continue;
+        const path = join(projectDir, f);
+        if (verbose) console.error(`[mirror] detected fresh session: ${path}`);
+        return path;
+      }
+    } catch { /* retry */ }
+  }
+  return null;
+}
+
+/**
+ * CLI-mode mirror: wires the ported cli-renderer so one evolving
+ * throbber message per turn shows spinner + thinking (inside a
+ * Telegram spoiler) + compact tool-call lines + live assistant text
+ * preview, then collapses to the final formatted message when the
+ * turn ends.
+ *
+ * Requires a jsonl path. For --resume-session that is deterministic;
+ * for fresh sessions we await resolveSessionFilePath. Returns a stop
+ * handle exposed by the underlying startJsonlMirror (which the
+ * wrapper calls on Ctrl-C).
+ */
+async function startCliMirror({ resumeSessionId, projectDir, botToken, chatId, onResolve, verbose }) {
+  const filePath = await resolveSessionFilePath({
+    projectDir,
+    resumeSessionId,
+    verbose,
+  });
+  if (!filePath) {
+    console.error('[mirror] no session file detected within 30s; mirror disabled');
+    return { stop() { /* no-op */ } };
+  }
+  if (typeof onResolve === 'function') onResolve(filePath);
+
+  const channel = createTelegramChannel({
+    botToken,
+    chatId,
+    fetchImpl: fetch,
+  });
+
+  return startJsonlMirrorCli({
+    filePath,
+    channel,
+    renderFinal: (md) => markdownToTelegramHtml(md),
+    splitFinal: (text) => splitMarkdownForTelegram(text, 4000),
+    label: 'Claude is working',
+    verbose,
+  });
+}
+
 function startJsonlMirror({ repoRoot, resumeSessionId, onText, onResolve, verbose }) {
   const projectsRoot = join(homedir(), '.claude', 'projects');
   const sanitized = repoRoot.replace(/[:\\/]/g, '-');

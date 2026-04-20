@@ -61,6 +61,13 @@ Forward extra arguments to `claude`:
 cc-telegram --claude-args "--permission-mode auto"
 ```
 
+Pick the mirror UX (default is `cli`):
+
+```bash
+cc-telegram --mode cli      # rich throbber, thinking-in-spoiler, tool lines
+cc-telegram --mode simple   # one plain message per assistant text block
+```
+
 Turn off the response mirror (messages in, no messages back):
 
 ```bash
@@ -68,6 +75,37 @@ cc-telegram --no-mirror
 ```
 
 Stop: Ctrl-C in the wrapper terminal. The child `claude` exits cleanly and the poller stops.
+
+## Mirror modes
+
+Both modes tail the session jsonl as ground truth; they just render it differently.
+
+### `--mode cli` (default)
+
+One Telegram message per Claude **turn**, edited in place as the turn progresses. Collapses all tool calls, thinking, and streamed text into a single evolving throbber, then re-edits the same message to show the final assistant response when the turn ends. Long finals spill into additional messages on paragraph boundaries.
+
+```
+┌───────────────────────────────┐
+│ 🟡 Claude is working... (7s)  │
+│                               │
+│ ▸ Read  path/to/file.ts       │
+│ ▸ Bash  npm run build         │
+│ ▸ Edit  src/index.ts (3 hunks)│
+│                               │
+│ ▾ Thinking (tap to reveal)    │
+│                               │
+│ Draft: "The issue is in the   │
+│ handler, it does not clean..."│
+│                               │
+│ [ Stop ]                      │
+└───────────────────────────────┘
+```
+
+Rate-limited to one edit every ~1.5s so Telegram does not throttle the bot. Tool calls, thinking blocks, and live text preview are all emitted by the cli-renderer primitive in `bin/lib/cli-renderer/`.
+
+### `--mode simple`
+
+Legacy one-message-per-assistant-entry behavior. No throbber, no tool visibility, no thinking. Use this if you want the lowest surface area, or your chat is paused and you just want the final replies to land after the fact.
 
 ## How it works
 
